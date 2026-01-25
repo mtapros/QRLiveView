@@ -16,7 +16,7 @@ import csv
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.window import Window
-from kivy.graphics import Color, Line, Rectangle
+from kivy.graphics import Color, Line, Rectangle, Mesh
 from kivy.graphics.texture import Texture
 from kivy.metrics import dp, sp
 from kivy.properties import NumericProperty, BooleanProperty
@@ -79,6 +79,7 @@ class PreviewOverlay(FloatLayout):
     show_810 = BooleanProperty(True)
     show_oval = BooleanProperty(True)
 
+    # QR overlay
     show_qr = BooleanProperty(True)
 
     grid_n = NumericProperty(3)
@@ -101,6 +102,7 @@ class PreviewOverlay(FloatLayout):
         self.add_widget(self.img)
 
         lw = 2
+        lw_qr = 6  # thicker QR outline
 
         with self.img.canvas.after:
             self._c_border = Color(0.2, 0.6, 1.0, 1.0)
@@ -118,8 +120,12 @@ class PreviewOverlay(FloatLayout):
             self._c_oval = Color(0.7, 0.2, 1.0, 0.95)
             self._ln_oval = Line(width=lw)
 
+            # QR fill first (so line draws on top)
+            self._c_qr_fill = Color(0.2, 1.0, 0.2, 0.50)
+            self._mesh_qr = Mesh(vertices=[], indices=[], mode="triangle_fan")
+
             self._c_qr = Color(0.2, 1.0, 0.2, 0.95)
-            self._ln_qr = Line(width=lw, close=True)
+            self._ln_qr = Line(width=lw_qr, close=True)
 
         self.bind(pos=self._redraw, size=self._redraw)
         self.bind(
@@ -130,7 +136,7 @@ class PreviewOverlay(FloatLayout):
         )
         self.img.bind(pos=self._redraw, size=self._redraw, texture=self._redraw, texture_size=self._redraw)
 
-        self._qr_points_px = None
+        self._qr_points_px = None  # list[(x,y)] length 4
         self._redraw()
 
     def set_texture(self, texture):
@@ -183,8 +189,10 @@ class PreviewOverlay(FloatLayout):
     def _redraw(self, *args):
         fx, fy, fw, fh = self._drawn_rect()
 
+        # Border
         self._ln_border.rectangle = (fx, fy, fw, fh) if self.show_border else (0, 0, 0, 0)
 
+        # Crops
         if self.show_57:
             asp57 = self._crop_aspect(5.0, 7.0, fw, fh)
             self._ln_57.rectangle = self._center_crop_rect(fx, fy, fw, fh, asp57)
@@ -197,6 +205,7 @@ class PreviewOverlay(FloatLayout):
         else:
             self._ln_810.rectangle = (0, 0, 0, 0)
 
+        # Grid
         n = int(self.grid_n)
         if self.show_grid and n >= 2:
             pts = []
@@ -210,6 +219,7 @@ class PreviewOverlay(FloatLayout):
         else:
             self._ln_grid.points = []
 
+        # Oval
         if self.show_oval:
             cx = fx + fw * float(self.oval_cx)
             cy = fy + fh * float(self.oval_cy)
@@ -228,16 +238,33 @@ class PreviewOverlay(FloatLayout):
             self._clear_line_modes(self._ln_oval)
             self._ln_oval.ellipse = (0, 0, 0, 0)
 
+        # QR fill + outline
         if self.show_qr and self._qr_points_px and self.img.texture and self.img.texture.size[0] > 0:
-            iw, ih = self.img.texture.size
+            iw, ih = self.img.texture.size  # rotated image size
             dx, dy, dw, dh = fx, fy, fw, fh
-            pts = []
+
+            pts_xy = []
+            line_pts = []
             for (x, y) in self._qr_points_px:
                 u = float(x) / float(iw)
                 v = float(y) / float(ih)
-                pts += [dx + u * dw, dy + v * dh]
-            self._ln_qr.points = pts
+                sx = dx + u * dw
+                sy = dy + v * dh
+                pts_xy.append((sx, sy))
+                line_pts += [sx, sy]
+
+            # Fill polygon with Mesh (triangle_fan). [web:8]
+            verts = []
+            for (sx, sy) in pts_xy:
+                verts += [sx, sy, 0.0, 0.0]  # x, y, u, v
+            self._mesh_qr.vertices = verts
+            self._mesh_qr.indices = list(range(len(pts_xy)))
+
+            # Outline on top
+            self._ln_qr.points = line_pts
         else:
+            self._mesh_qr.vertices = []
+            self._mesh_qr.indices = []
             self._ln_qr.points = []
 
 
@@ -752,7 +779,7 @@ class CanonLiveViewApp(App):
                 pass
             self.session_started = False
 
-        self._set_qr_ui(None, None, note="QR: none")
+        # Don't force-clear QR status on stop; leave last known value visible.
         self.status.text = "Status: connected (live stopped)" if self.connected else "Status: not connected"
         self.log("Live view stopped")
         self._set_controls_idle()
@@ -812,9 +839,9 @@ class CanonLiveViewApp(App):
                 rgb = np.array(pil)
                 bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
-                data, points, _ = self._qr_detector.detectAndDecode(bgr)
+                decoded, points, _ = self._qr_detector.detectAndDecode(bgr)
 
-                qr_text = data.strip() if isinstance(data, str) else ""
+                qr_text = decoded.strip() if isinstance(decoded, str) else ""
                 qr_points = None
                 if points is not None:
                     try:
@@ -835,6 +862,7 @@ class CanonLiveViewApp(App):
 
     def _publish_qr(self, text, points):
         now = time.time()
+
         if text:
             if (text not in self._qr_seen) and (now - self._qr_last_add_time >= self.qr_new_gate_s):
                 self._qr_seen.add(text)
@@ -843,22 +871,28 @@ class CanonLiveViewApp(App):
 
             self._maybe_commit_author(text, source="qr")
 
+        # Status line: do NOT overwrite last decoded text with "undecoded"
         if not self.qr_enabled:
             note = "QR: off"
         elif text:
             note = f"QR: {text[:80]}"
         elif points:
-            note = "QR: detected (undecoded)"
+            note = self.qr_status.text if self.qr_status.text and self.qr_status.text != "QR: none" else "QR: detected (undecoded)"
         else:
-            note = self.qr_status.text if hasattr(self, "qr_status") else "QR: none"
+            note = self.qr_status.text if self.qr_status.text else "QR: none"
 
         Clock.schedule_once(lambda *_: self._set_qr_ui(text, points, note=note), 0)
 
     def _set_qr_ui(self, text, points, note="QR: none"):
-        self._latest_qr_text = text
-        self._latest_qr_points = points
+        if text:
+            self._latest_qr_text = text
+        if points:
+            self._latest_qr_points = points
+
         self.qr_status.text = note
-        self.preview.set_qr(points)
+        # Always update overlay if we have points (but keep last points if new ones absent)
+        if points is not None:
+            self.preview.set_qr(points)
 
     def _ui_decode_and_display(self, dt):
         if not self.live_running:
@@ -930,22 +964,38 @@ class CanonLiveViewApp(App):
         Intent = autoclass("android.content.Intent")
         intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
         intent.addCategory(Intent.CATEGORY_OPENABLE)
-        intent.setType("*/*")
 
-        String = autoclass("java.lang.String")
-        mime_types = [String("text/csv"), String("text/comma-separated-values"), String("text/plain"), String("application/vnd.ms-excel")]
-        intent.putExtra(Intent.EXTRA_MIME_TYPES, mime_types)
+        # Allow any openable file so providers can't grey out mislabeled CSVs. [web:201]
+        intent.setType("*/*")
 
         PythonActivity = autoclass("org.kivy.android.PythonActivity")
         currentActivity = PythonActivity.mActivity
         currentActivity.startActivityForResult(intent, self._filepicker_request_code)
+
+    def _android_uri_display_name(self, uri):
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        currentActivity = PythonActivity.mActivity
+        resolver = currentActivity.getContentResolver()
+
+        OpenableColumns = autoclass("android.provider.OpenableColumns")
+        name = ""
+        cursor = resolver.query(uri, None, None, None, None)
+        if cursor:
+            try:
+                if cursor.moveToFirst():
+                    idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if idx >= 0:
+                        name = cursor.getString(idx) or ""
+            finally:
+                cursor.close()
+        return name
 
     def _on_activity_result(self, requestCode, resultCode, intent):
         if requestCode != self._filepicker_request_code:
             return
 
         if intent is None:
-            Clock.schedule_once(lambda *_: self._students_set_status("CSV pick cancelled"), 0)
+            Clock.schedule_once(lambda *_: self._students_set_status("Pick cancelled"), 0)
             return
 
         try:
@@ -953,7 +1003,15 @@ class CanonLiveViewApp(App):
             if uri is None:
                 Clock.schedule_once(lambda *_: self._students_set_status("No file selected"), 0)
                 return
+
+            # Best-effort extension check, then authoritative header check. [web:192]
+            name = self._android_uri_display_name(uri)
+            if name and (not name.lower().endswith(".csv")):
+                Clock.schedule_once(lambda *_: self._students_set_status(f"Not a .csv file: {name}"), 0)
+                return
+
             self._load_csv_from_android_uri(uri)
+
         except Exception as e:
             Clock.schedule_once(lambda *_: self._students_set_status(f"CSV load error: {e}"), 0)
 
@@ -1049,7 +1107,9 @@ class CanonLiveViewApp(App):
         self._students_selected = rec
         if self._students_use_btn is not None:
             self._students_use_btn.disabled = False
-        self._students_set_status(f"Selected: {rec.get('LAST_NAME','')}, {rec.get('FIRST_NAME','')} ({rec.get('STUDENT_ID','')})")
+        self._students_set_status(
+            f"Selected: {rec.get('LAST_NAME','')}, {rec.get('FIRST_NAME','')} ({rec.get('STUDENT_ID','')})"
+        )
 
     def _open_students_popup(self):
         self._android_setup_filepicker()
