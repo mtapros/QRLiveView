@@ -59,7 +59,7 @@ jobs:
             "build-tools;28.0.2" \
             "ndk;25.2.9519653"
 
-          # Legacy SDK Tools shim for OpenCV's CMake detection
+          # Legacy SDK Tools shim for OpenCV's CMake detection on cmdline-tools installs. [web:99]
           mkdir -p "$ANDROID_SDK_ROOT/tools/bin"
           ln -sf "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "$ANDROID_SDK_ROOT/tools/bin/sdkmanager"
           ln -sf "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/avdmanager" "$ANDROID_SDK_ROOT/tools/bin/avdmanager"
@@ -67,8 +67,6 @@ jobs:
           echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
           echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/25.2.9519653" >> "$GITHUB_ENV"
-
-          # Point OpenCV to the shim that looks like old SDK Tools
           echo "ANDROID_SDK_TOOLS=$ANDROID_SDK_ROOT/tools" >> "$GITHUB_ENV"
 
       - name: Build APK with python-for-android
@@ -86,7 +84,7 @@ jobs:
             --name CanonLiveView \
             --version 0.1.0 \
             --bootstrap sdl2 \
-            --requirements python3,kivy,pillow,numpy,opencv \
+            --requirements python3,kivy,pillow,numpy,opencv,pyjnius \
             --permission android.permission.INTERNET \
             --permission android.permission.ACCESS_NETWORK_STATE \
             --permission android.permission.ACCESS_WIFI_STATE \
