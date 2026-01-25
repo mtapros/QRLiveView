@@ -11,6 +11,7 @@ import time
 from datetime import datetime
 from io import BytesIO
 import http.client
+import csv
 
 from kivy.app import App
 from kivy.clock import Clock
@@ -27,10 +28,13 @@ from kivy.uix.dropdown import DropDown
 from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.image import Image
 from kivy.uix.label import Label
+from kivy.uix.popup import Popup
+from kivy.uix.recycleview import RecycleView
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.scatter import Scatter
 from kivy.uix.slider import Slider
 from kivy.uix.textinput import TextInput
+from kivy.utils import platform
 
 from PIL import Image as PILImage
 
@@ -38,9 +42,14 @@ from PIL import Image as PILImage
 import cv2
 import numpy as np
 
+# Android SAF picker (pyjnius)
+if platform == "android":
+    from jnius import autoclass
+    from android import activity
+    from android.runnable import run_on_ui_thread
+
 
 def pil_rotate_90s(img, ang):
-    """Rotate image by 0/90/180/270 degrees; compatible with old+new Pillow."""
     ang = int(ang) % 360
     if ang == 0:
         return img
@@ -64,18 +73,12 @@ def pil_rotate_90s(img, ang):
 
 
 class PreviewOverlay(FloatLayout):
-    """
-    No-stretch preview with correct overlays:
-      - Image is keep_ratio/contain.
-      - Overlays are drawn in Image.canvas.after and use Image.norm_image_size.
-    """
     show_border = BooleanProperty(True)
     show_grid = BooleanProperty(True)
     show_57 = BooleanProperty(True)
     show_810 = BooleanProperty(True)
     show_oval = BooleanProperty(True)
 
-    # QR
     show_qr = BooleanProperty(True)
 
     grid_n = NumericProperty(3)
@@ -97,32 +100,26 @@ class PreviewOverlay(FloatLayout):
             pass
         self.add_widget(self.img)
 
-        lw = 2  # physical pixels
+        lw = 2
 
         with self.img.canvas.after:
-            # Border (blue)
             self._c_border = Color(0.2, 0.6, 1.0, 1.0)
             self._ln_border = Line(width=lw)
 
-            # Grid (orange) - vertical/horizontal only
             self._c_grid = Color(1.0, 0.6, 0.0, 0.85)
             self._ln_grid = Line(width=lw)
 
-            # Crops
             self._c_57 = Color(1.0, 0.2, 0.2, 0.95)
             self._ln_57 = Line(width=lw)
 
             self._c_810 = Color(1.0, 0.9, 0.2, 0.95)
             self._ln_810 = Line(width=lw)
 
-            # Oval
             self._c_oval = Color(0.7, 0.2, 1.0, 0.95)
             self._ln_oval = Line(width=lw)
 
-            # QR overlay (green)
             self._c_qr = Color(0.2, 1.0, 0.2, 0.95)
             self._ln_qr = Line(width=lw, close=True)
-            # (Text label is handled by app-level Label overlay for simplicity)
 
         self.bind(pos=self._redraw, size=self._redraw)
         self.bind(
@@ -133,9 +130,7 @@ class PreviewOverlay(FloatLayout):
         )
         self.img.bind(pos=self._redraw, size=self._redraw, texture=self._redraw, texture_size=self._redraw)
 
-        # Latest QR points in image pixel coords (rotated image coords)
-        self._qr_points_px = None  # list[(x,y)] length 4
-
+        self._qr_points_px = None
         self._redraw()
 
     def set_texture(self, texture):
@@ -143,7 +138,6 @@ class PreviewOverlay(FloatLayout):
         self._redraw()
 
     def set_qr(self, points_px):
-        """points_px: list of 4 (x,y) in rotated image pixel coordinates, or None"""
         self._qr_points_px = points_px
         self._redraw()
 
@@ -172,13 +166,11 @@ class PreviewOverlay(FloatLayout):
         return (x, y, w, h)
 
     def _crop_aspect(self, a_w, a_h, fw, fh):
-        # Landscape => swap so crop is oriented correctly
         if fw >= fh:
             return float(a_h) / float(a_w)
         return float(a_w) / float(a_h)
 
     def _clear_line_modes(self, ln: Line):
-        # Clearing all modes prevents stale geometry artifacts.
         try:
             ln.points = []
         except Exception:
@@ -191,10 +183,8 @@ class PreviewOverlay(FloatLayout):
     def _redraw(self, *args):
         fx, fy, fw, fh = self._drawn_rect()
 
-        # Border
         self._ln_border.rectangle = (fx, fy, fw, fh) if self.show_border else (0, 0, 0, 0)
 
-        # Crops
         if self.show_57:
             asp57 = self._crop_aspect(5.0, 7.0, fw, fh)
             self._ln_57.rectangle = self._center_crop_rect(fx, fy, fw, fh, asp57)
@@ -207,7 +197,6 @@ class PreviewOverlay(FloatLayout):
         else:
             self._ln_810.rectangle = (0, 0, 0, 0)
 
-        # Grid (NO diagonals)
         n = int(self.grid_n)
         if self.show_grid and n >= 2:
             pts = []
@@ -221,7 +210,6 @@ class PreviewOverlay(FloatLayout):
         else:
             self._ln_grid.points = []
 
-        # Oval: explicitly clear other modes to prevent stale Line geometry artifacts.
         if self.show_oval:
             cx = fx + fw * float(self.oval_cx)
             cy = fy + fh * float(self.oval_cy)
@@ -240,19 +228,14 @@ class PreviewOverlay(FloatLayout):
             self._clear_line_modes(self._ln_oval)
             self._ln_oval.ellipse = (0, 0, 0, 0)
 
-        # QR polygon overlay
         if self.show_qr and self._qr_points_px and self.img.texture and self.img.texture.size[0] > 0:
-            iw, ih = self.img.texture.size  # rotated image size
+            iw, ih = self.img.texture.size
             dx, dy, dw, dh = fx, fy, fw, fh
-
             pts = []
             for (x, y) in self._qr_points_px:
                 u = float(x) / float(iw)
                 v = float(y) / float(ih)
-                sx = dx + u * dw
-                sy = dy + v * dh
-                pts += [sx, sy]
-
+                pts += [dx + u * dw, dy + v * dh]
             self._ln_qr.points = pts
         else:
             self._ln_qr.points = []
@@ -301,9 +284,31 @@ class CanonLiveViewApp(App):
         self._qr_detector = cv2.QRCodeDetector()
         self._qr_thread = None
         self._latest_qr_text = None
-        self._latest_qr_points = None  # list[(x,y)] in rotated image px coords
+        self._latest_qr_points = None
         self._qr_seen = set()
         self._qr_last_add_time = 0.0
+
+        # Author auto-update
+        self.author_max_chars = 60
+        self._last_committed_author = None
+        self._author_update_in_flight = False
+
+        # Manual payload
+        self.manual_payload = ""
+
+        # Students/CSV
+        self.students = []
+        self.filtered_students = []
+        self._students_popup = None
+        self._students_rv = None
+        self._students_search = ""
+        self._students_selected = None
+        self._students_use_btn = None
+        self._students_popup_status = None
+
+        # Android file picker
+        self._filepicker_ready = False
+        self._filepicker_request_code = 5011
 
     def build(self):
         root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(8))
@@ -345,7 +350,6 @@ class CanonLiveViewApp(App):
         root.add_widget(self.status)
         root.add_widget(self.metrics)
 
-        # QR status line
         self.qr_status = Label(text="QR: none", size_hint=(1, None), height=dp(22), font_size=sp(13))
         root.add_widget(self.qr_status)
 
@@ -371,7 +375,6 @@ class CanonLiveViewApp(App):
 
         preview_holder.bind(pos=fit_preview_to_holder, size=fit_preview_to_holder)
 
-        # Log section (hide/show)
         self.log_holder = BoxLayout(orientation="vertical", size_hint=(1, None), height=dp(150))
         log_sv = ScrollView(size_hint=(1, 1), do_scroll_x=False)
         self.log_label = Label(text="", size_hint_y=None, halign="left", valign="top", font_size=sp(11))
@@ -396,6 +399,8 @@ class CanonLiveViewApp(App):
         self._update_orientation_label()
         self.log("Ready")
         return root
+
+    # ---------------- Menu / UI ----------------
 
     def _orientation(self):
         w, h = Window.size
@@ -456,7 +461,8 @@ class CanonLiveViewApp(App):
         def add_slider(text, minv, maxv, val, step, on_change, label_w=dp(110)):
             row = BoxLayout(size_hint_y=None, height=dp(42), padding=[dp(6), 0, dp(6), 0], spacing=dp(6))
             add_row_bg(row)
-            row.add_widget(Label(text=text, size_hint=(None, 1), width=label_w, font_size=sp(13), color=(1, 1, 1, 1)))
+            row.add_widget(Label(text=text, size_hint=(None, 1), width=label_w,
+                                 font_size=sp(13), color=(1, 1, 1, 1)))
             s = Slider(min=minv, max=maxv, value=val, step=step)
             vlab = Label(text=str(int(val) if step == 1 else f"{val:.2f}"),
                          size_hint=(None, 1), width=dp(55), font_size=sp(13), color=(1, 1, 1, 1))
@@ -469,6 +475,17 @@ class CanonLiveViewApp(App):
             row.add_widget(s)
             row.add_widget(vlab)
             dd.add_widget(row)
+
+        def add_text_input(label, initial, on_change, hint=""):
+            row = BoxLayout(size_hint_y=None, height=dp(46), padding=[dp(6), 0, dp(6), 0], spacing=dp(6))
+            add_row_bg(row)
+            row.add_widget(Label(text=label, size_hint=(None, 1), width=dp(110),
+                                 font_size=sp(13), color=(1, 1, 1, 1)))
+            ti = TextInput(text=initial, multiline=False, hint_text=hint, font_size=sp(13))
+            ti.bind(text=lambda inst, val: on_change(val))
+            row.add_widget(ti)
+            dd.add_widget(row)
+            return ti
 
         add_header("Device")
         self.orientation_label = Label(text=f"Orientation: {self._orientation()}",
@@ -500,14 +517,10 @@ class CanonLiveViewApp(App):
         add_toggle("QR detect (OpenCV)", True, lambda v: self._set_qr_enabled(v))
         add_slider("QR interval (s)", 0.05, 1.0, self.qr_interval_s, 0.01, lambda v: self._set_qr_interval(v), label_w=dp(140))
 
-        add_header("Grid")
-        add_slider("Divisions", 0, 10, 3, 1, lambda v: setattr(self.preview, "grid_n", int(v)))
-
-        add_header("Oval")
-        add_slider("Center X", 0.0, 1.0, 0.5, 0.01, lambda v: setattr(self.preview, "oval_cx", float(v)))
-        add_slider("Center Y", 0.0, 1.0, 0.5, 0.01, lambda v: setattr(self.preview, "oval_cy", float(v)))
-        add_slider("Width", 0.1, 1.0, 0.55, 0.01, lambda v: setattr(self.preview, "oval_w", float(v)))
-        add_slider("Height", 0.1, 1.0, 0.75, 0.01, lambda v: setattr(self.preview, "oval_h", float(v)))
+        add_header("Author")
+        add_text_input("Payload", "", lambda v: setattr(self, "manual_payload", v), hint="Write to Author (<=60 chars)")
+        add_button("Push payload (Author)", lambda: self._maybe_commit_author(self.manual_payload, source="manual"))
+        add_button("Students…", lambda: self._open_students_popup())
 
         add_header("UI")
         add_toggle("Show log", True, lambda v: self._set_log_visible(v))
@@ -515,43 +528,7 @@ class CanonLiveViewApp(App):
 
         return dd
 
-    def _set_qr_enabled(self, enabled: bool):
-        self.qr_enabled = bool(enabled)
-        if not self.qr_enabled:
-            self._set_qr_ui(None, None, note="QR: off")
-
-    def _set_qr_interval(self, interval_s: float):
-        try:
-            self.qr_interval_s = float(interval_s)
-        except Exception:
-            self.qr_interval_s = 0.15
-
-    def _set_adjust_enabled(self, enabled: bool):
-        self.preview_scatter.do_translation = bool(enabled)
-        self.preview_scatter.do_scale = bool(enabled)
-
-    def _on_fps_change(self, *_):
-        fps = int(self.fps_slider.value)
-        self.fps_label.text = str(fps)
-        self._reschedule_display_loop(fps)
-
-    def _reschedule_display_loop(self, fps):
-        if self._display_event is not None:
-            self._display_event.cancel()
-        fps = max(1, int(fps))
-        self._display_event = Clock.schedule_interval(self._ui_decode_and_display, 1.0 / fps)
-
-    def _set_controls_idle(self):
-        self.ip_input.disabled = False
-        self.connect_btn.disabled = False
-        self.start_btn.disabled = not self.connected
-        self.stop_btn.disabled = True
-
-    def _set_controls_running(self):
-        self.ip_input.disabled = True
-        self.connect_btn.disabled = True
-        self.start_btn.disabled = True
-        self.stop_btn.disabled = False
+    # ---------------- General ----------------
 
     def log(self, msg):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -613,6 +590,111 @@ class CanonLiveViewApp(App):
 
         self._set_controls_idle()
 
+    # ---------------- Author update logic ----------------
+
+    def _author_value(self, payload: str) -> str:
+        s = (payload or "").strip()
+        if not s:
+            return ""
+        return s[: int(self.author_max_chars)]
+
+    def _maybe_commit_author(self, payload: str, source="qr"):
+        value = self._author_value(payload)
+        if not value:
+            return
+        if not self.connected:
+            self.log(f"Author update skipped ({source}): not connected")
+            return
+        if self._last_committed_author == value:
+            return
+        if self._author_update_in_flight:
+            return
+
+        self._author_update_in_flight = True
+        Clock.schedule_once(lambda *_: setattr(self.qr_status, "text", f"Author updating… ({source})"), 0)
+        threading.Thread(target=self._commit_author_worker, args=(value, source), daemon=True).start()
+
+    def _commit_author_worker(self, value: str, source: str):
+        ok = False
+        got = None
+        err = None
+        try:
+            st_put, _ = self._json_call(
+                "PUT",
+                "/ccapi/ver100/functions/registeredname/author",
+                {"author": value},
+                timeout=8.0
+            )
+            if not st_put.startswith("200"):
+                raise Exception(f"PUT failed: {st_put}")
+
+            st_get, data = self._json_call(
+                "GET",
+                "/ccapi/ver100/functions/registeredname/author",
+                None,
+                timeout=8.0
+            )
+            if not st_get.startswith("200") or not isinstance(data, dict):
+                raise Exception(f"GET failed: {st_get}")
+
+            got = (data.get("author") or "").strip()
+            ok = (got == value)
+
+        except Exception as e:
+            err = str(e)
+
+        def _finish(_dt):
+            self._author_update_in_flight = False
+            if ok:
+                self._last_committed_author = value
+                self.log(f"Author updated+verified ({source}): '{value}'")
+                self.qr_status.text = "Author updated ✓"
+            else:
+                self.log(f"Author verify failed ({source}). wrote='{value}' read='{got}' err='{err}'")
+                self.qr_status.text = "Author verify failed ✗"
+
+        Clock.schedule_once(_finish, 0)
+
+    # ---------------- QR + Live view ----------------
+
+    def _set_qr_enabled(self, enabled: bool):
+        self.qr_enabled = bool(enabled)
+        if not self.qr_enabled:
+            self._set_qr_ui(None, None, note="QR: off")
+
+    def _set_qr_interval(self, interval_s: float):
+        try:
+            self.qr_interval_s = float(interval_s)
+        except Exception:
+            self.qr_interval_s = 0.15
+
+    def _set_adjust_enabled(self, enabled: bool):
+        self.preview_scatter.do_translation = bool(enabled)
+        self.preview_scatter.do_scale = bool(enabled)
+
+    def _on_fps_change(self, *_):
+        fps = int(self.fps_slider.value)
+        self.fps_label.text = str(fps)
+        self._reschedule_display_loop(fps)
+
+    def _reschedule_display_loop(self, fps):
+        if self._display_event is not None:
+            self._display_event.cancel()
+        fps = max(1, int(fps))
+        self._display_event = Clock.schedule_interval(self._ui_decode_and_display, 1.0 / fps)
+
+    def _set_controls_idle(self):
+        self.ip_input.disabled = False
+        self.connect_btn.disabled = False
+        self.start_btn.disabled = not self.connected
+        self.stop_btn.disabled = True
+
+    def _set_controls_running(self):
+        self.ip_input.disabled = True
+        self.connect_btn.disabled = True
+        self.start_btn.disabled = True
+        self.stop_btn.disabled = False
+
     def start_liveview(self):
         if not self.connected or self.live_running:
             return
@@ -638,7 +720,6 @@ class CanonLiveViewApp(App):
         self._frame_texture = None
         self._frame_size = None
 
-        # reset QR state
         self._latest_qr_text = None
         self._latest_qr_points = None
         self._qr_seen = set()
@@ -653,7 +734,6 @@ class CanonLiveViewApp(App):
         self._fetch_thread = threading.Thread(target=self._flip_fetch_keepalive_loop, daemon=True)
         self._fetch_thread.start()
 
-        # QR worker
         self._qr_thread = threading.Thread(target=self._qr_loop, daemon=True)
         self._qr_thread.start()
 
@@ -718,10 +798,8 @@ class CanonLiveViewApp(App):
                 time.sleep(0.10)
                 continue
 
-            # grab the newest JPEG snapshot
             with self._lock:
                 jpeg = self._latest_jpeg
-                jpeg_ts = self._latest_jpeg_ts
 
             if not jpeg:
                 time.sleep(0.05)
@@ -746,20 +824,16 @@ class CanonLiveViewApp(App):
                     except Exception:
                         qr_points = None
 
-                # Update overlay even if undecoded, if corners are present
+                # Keep last result; don't clear on misses.
                 if qr_text or qr_points:
                     self._publish_qr(qr_text if qr_text else None, qr_points)
-                else:
-                    self._publish_qr(None, None)
 
             except Exception:
-                # keep quiet; QR is best-effort
                 pass
 
             time.sleep(max(0.05, float(self.qr_interval_s)))
 
     def _publish_qr(self, text, points):
-        # Gate "new QR" events (log/list behaviors), but still allow overlay refresh.
         now = time.time()
         if text:
             if (text not in self._qr_seen) and (now - self._qr_last_add_time >= self.qr_new_gate_s):
@@ -767,7 +841,8 @@ class CanonLiveViewApp(App):
                 self._qr_last_add_time = now
                 self.log(f"QR: {text}")
 
-        note = None
+            self._maybe_commit_author(text, source="qr")
+
         if not self.qr_enabled:
             note = "QR: off"
         elif text:
@@ -775,7 +850,7 @@ class CanonLiveViewApp(App):
         elif points:
             note = "QR: detected (undecoded)"
         else:
-            note = "QR: none"
+            note = self.qr_status.text if hasattr(self, "qr_status") else "QR: none"
 
         Clock.schedule_once(lambda *_: self._set_qr_ui(text, points, note=note), 0)
 
@@ -839,6 +914,209 @@ class CanonLiveViewApp(App):
             self._decode_count = 0
             self._display_count = 0
             self._stat_t0 = now
+
+    # ---------------- Students popup + SAF CSV picker ----------------
+
+    def _android_setup_filepicker(self):
+        if platform != "android":
+            return
+        if self._filepicker_ready:
+            return
+        activity.bind(on_activity_result=self._on_activity_result)
+        self._filepicker_ready = True
+
+    @run_on_ui_thread
+    def _android_open_csv_picker(self):
+        Intent = autoclass("android.content.Intent")
+        intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+        intent.addCategory(Intent.CATEGORY_OPENABLE)
+        intent.setType("*/*")
+
+        String = autoclass("java.lang.String")
+        mime_types = [String("text/csv"), String("text/comma-separated-values"), String("text/plain"), String("application/vnd.ms-excel")]
+        intent.putExtra(Intent.EXTRA_MIME_TYPES, mime_types)
+
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        currentActivity = PythonActivity.mActivity
+        currentActivity.startActivityForResult(intent, self._filepicker_request_code)
+
+    def _on_activity_result(self, requestCode, resultCode, intent):
+        if requestCode != self._filepicker_request_code:
+            return
+
+        if intent is None:
+            Clock.schedule_once(lambda *_: self._students_set_status("CSV pick cancelled"), 0)
+            return
+
+        try:
+            uri = intent.getData()
+            if uri is None:
+                Clock.schedule_once(lambda *_: self._students_set_status("No file selected"), 0)
+                return
+            self._load_csv_from_android_uri(uri)
+        except Exception as e:
+            Clock.schedule_once(lambda *_: self._students_set_status(f"CSV load error: {e}"), 0)
+
+    def _load_csv_from_android_uri(self, uri):
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        currentActivity = PythonActivity.mActivity
+        resolver = currentActivity.getContentResolver()
+
+        istr = resolver.openInputStream(uri)
+        if istr is None:
+            raise Exception("openInputStream returned None")
+
+        ByteArrayOutputStream = autoclass("java.io.ByteArrayOutputStream")
+        baos = ByteArrayOutputStream()
+
+        jbuf = autoclass("java.nio.ByteBuffer").allocate(8192)
+        arr = jbuf.array()
+
+        while True:
+            n = istr.read(arr)
+            if n == -1:
+                break
+            baos.write(arr, 0, n)
+
+        istr.close()
+        data = baos.toByteArray()
+
+        # Java byte[] -> Python bytes
+        py_bytes = bytes([(b + 256) % 256 for b in data])
+
+        self._parse_csv_bytes(py_bytes)
+
+    def _parse_csv_bytes(self, b: bytes):
+        try:
+            text = b.decode("utf-8-sig")
+        except Exception:
+            text = b.decode("latin-1", errors="replace")
+
+        reader = csv.DictReader(text.splitlines())
+        required = ["FIRST_NAME", "LAST_NAME", "TEACHER", "GRADE", "STUDENT_ID"]
+
+        if not reader.fieldnames:
+            raise Exception("CSV has no header row")
+
+        missing = [c for c in required if c not in reader.fieldnames]
+        if missing:
+            raise Exception("Missing columns: " + ", ".join(missing))
+
+        rows = []
+        for r in reader:
+            rows.append({k: (r.get(k) or "").strip() for k in required})
+
+        def _finish(_dt):
+            self.students = rows
+            self._students_set_status(f"Loaded {len(rows)} students")
+            self.log(f"Loaded CSV: {len(rows)} rows")
+            self._students_refresh_list()
+
+        Clock.schedule_once(_finish, 0)
+
+    def _students_set_status(self, msg: str):
+        if self._students_popup_status is not None:
+            self._students_popup_status.text = msg
+
+    def _students_refresh_list(self):
+        if not self._students_rv:
+            return
+
+        q = (self._students_search or "").strip().lower()
+        out = []
+        for s in self.students:
+            first = (s.get("FIRST_NAME") or "").lower()
+            last = (s.get("LAST_NAME") or "").lower()
+            sid = (s.get("STUDENT_ID") or "").lower()
+            if (not q) or (q in first) or (q in last) or (q in sid):
+                out.append(s)
+
+        self.filtered_students = out
+
+        self._students_rv.viewclass = "Button"
+        self._students_rv.data = [{
+            "text": f"{x.get('LAST_NAME','')}, {x.get('FIRST_NAME','')}  ({x.get('GRADE','')})  {x.get('STUDENT_ID','')}",
+            "size_hint_y": None,
+            "height": dp(44),
+            "on_release": (lambda rec=x: self._students_select(rec))
+        } for x in out]
+
+        self._students_selected = None
+        if self._students_use_btn is not None:
+            self._students_use_btn.disabled = True
+
+    def _students_select(self, rec):
+        self._students_selected = rec
+        if self._students_use_btn is not None:
+            self._students_use_btn.disabled = False
+        self._students_set_status(f"Selected: {rec.get('LAST_NAME','')}, {rec.get('FIRST_NAME','')} ({rec.get('STUDENT_ID','')})")
+
+    def _open_students_popup(self):
+        self._android_setup_filepicker()
+
+        if self._students_popup is not None:
+            self._students_popup.open()
+            self._students_refresh_list()
+            return
+
+        root = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8))
+
+        top = BoxLayout(size_hint=(1, None), height=dp(44), spacing=dp(8))
+        btn_load = Button(text="Load CSV", size_hint=(None, 1), width=dp(120))
+        lbl = Label(text="No CSV loaded", halign="left", valign="middle")
+        lbl.bind(size=lbl.setter("text_size"))
+        top.add_widget(btn_load)
+        top.add_widget(lbl)
+        root.add_widget(top)
+
+        search = TextInput(hint_text="Search FIRST/LAST/ID", multiline=False, size_hint=(1, None), height=dp(44))
+        root.add_widget(search)
+
+        rv = RecycleView()
+        rv.data = []
+        root.add_widget(rv)
+
+        bottom = BoxLayout(size_hint=(1, None), height=dp(44), spacing=dp(8))
+        btn_use = Button(text="Use selected", disabled=True)
+        btn_close = Button(text="Close")
+        bottom.add_widget(btn_use)
+        bottom.add_widget(btn_close)
+        root.add_widget(bottom)
+
+        self._students_popup_status = lbl
+        self._students_popup = Popup(title="Students", content=root, size_hint=(0.95, 0.90))
+        self._students_rv = rv
+        self._students_use_btn = btn_use
+
+        def on_search(_inst, val):
+            self._students_search = val
+            self._students_refresh_list()
+
+        search.bind(text=on_search)
+
+        def do_load():
+            if platform != "android":
+                self._students_set_status("CSV picker only implemented on Android")
+                return
+            self._students_set_status("Pick a CSV…")
+            self._android_open_csv_picker()
+
+        btn_load.bind(on_release=lambda *_: do_load())
+
+        def do_use():
+            if not self._students_selected:
+                return
+            s = self._students_selected
+            payload = f"{s.get('LAST_NAME','')}, {s.get('FIRST_NAME','')} ({s.get('GRADE','')}) - {s.get('TEACHER','')} [{s.get('STUDENT_ID','')}]"
+            self.manual_payload = payload
+            self.log(f"Selected student -> payload: {payload[:80]}")
+            self._students_popup.dismiss()
+
+        btn_use.bind(on_release=lambda *_: do_use())
+        btn_close.bind(on_release=lambda *_: self._students_popup.dismiss())
+
+        self._students_refresh_list()
+        self._students_popup.open()
 
     def on_stop(self):
         try:
