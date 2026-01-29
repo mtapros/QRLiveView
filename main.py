@@ -203,11 +203,9 @@ class PreviewOverlay(FloatLayout):
         n = int(self.grid_n)
         if self.show_grid and n >= 2:
             pts = []
-            # Vertical lines
             for i in range(1, n):
                 x = fx + fw * (i / n)
                 pts.extend([x, fy, x, fy + fh])
-            # Horizontal lines
             for i in range(1, n):
                 y = fy + fh * (i / n)
                 pts.extend([fx, y, fx + fw, y])
@@ -819,6 +817,18 @@ class DesktopCanonApp(App):
         else:
             note = self.qr_status.text if self.qr_status.text else "QR: none"
 
+        # Anti-jank: 5px threshold
+        if points and self._latest_qr_points:
+            moved = False
+            for i in range(min(len(points), len(self._latest_qr_points))):
+                dx = abs(points[i][0] - self._latest_qr_points[i][0])
+                dy = abs(points[i][1] - self._latest_qr_points[i][1])
+                if dx > 5 or dy > 5:
+                    moved = True
+                    break
+            if not moved and text == self._latest_qr_text:
+                return
+
         Clock.schedule_once(lambda *_: self._set_qr_ui(text, points, note=note), 0)
 
     def _set_qr_ui(self, text, points, note="QR: none"):
@@ -1225,38 +1235,37 @@ class DesktopCanonApp(App):
 
 
 if __name__ == "__main__":
-    DesktopCanonApp().run()    def _open_headers_popup(self):
-        """Let user pick which CSV columns to include in Author string"""
+    CanonLiveViewApp().run()    def _open_headers_popup(self):
         if not self.csv_headers:
-            self.log("No CSV loaded")
+            self.log("No CSV")
             return
 
         root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
-        root.add_widget(Label(text="Select columns for Author field (joined with _):",
-                              size_hint=(1, None), height=dp(40), font_size=sp(12)))
+        root.add_widget(Label(text="Select columns for Author (joined with _):",
+                              size_hint=(1, None), height=dp(36), font_size=sp(12)))
 
         sv = ScrollView(size_hint=(1, 1), do_scroll_x=False)
         inner = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4))
         inner.bind(minimum_height=inner.setter("height"))
         sv.add_widget(inner)
 
-        current_sel = set(self.selected_headers)
+        sel = set(self.selected_headers)
 
         for h in self.csv_headers:
             row = BoxLayout(size_hint_y=None, height=dp(36), spacing=dp(6))
             lbl = Label(text=h, size_hint=(0.7, 1), font_size=sp(13), halign="left", valign="middle")
             lbl.bind(size=lbl.setter("text_size"))
-            cb = CheckBox(active=(h in current_sel), size_hint=(0.3, 1))
+            cb = CheckBox(active=(h in sel), size_hint=(0.3, 1))
 
-            def toggle_cb(inst, val, header=h):
+            def toggle(inst, val, hdr=h):
                 if val:
-                    if header not in self.selected_headers:
-                        self.selected_headers.append(header)
+                    if hdr not in self.selected_headers:
+                        self.selected_headers.append(hdr)
                 else:
-                    if header in self.selected_headers:
-                        self.selected_headers.remove(header)
+                    if hdr in self.selected_headers:
+                        self.selected_headers.remove(hdr)
 
-            cb.bind(active=toggle_cb)
+            cb.bind(active=toggle)
             row.add_widget(lbl)
             row.add_widget(cb)
             inner.add_widget(row)
@@ -1270,11 +1279,6 @@ if __name__ == "__main__":
         btns.add_widget(btn_ok)
         root.add_widget(btns)
 
-        popup = Popup(title="Select CSV Columns", content=root, size_hint=(0.85, 0.75))
-
-        def do_ok(*_):
-            self.log(f"Selected headers: {self.selected_headers}")
-            popup.dismiss()
-
-        btn_ok.bind(on_release=do_ok)
+        popup = Popup(title="Select Columns", content=root, size_hint=(0.85, 0.75))
+        btn_ok.bind(on_release=lambda *_: (self.log(f"Selected: {self.selected_headers}"), popup.dismiss()))
         popup.open()
